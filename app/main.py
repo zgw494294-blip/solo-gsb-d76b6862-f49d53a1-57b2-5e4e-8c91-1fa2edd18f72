@@ -557,6 +557,22 @@ def _batch_full_error() -> BatchError:
     )
 
 
+def _same_event_content(a: Event, b: Event) -> bool:
+    """Whether two events sharing (replica_id, seq) have identical content.
+
+    Compares the key, the op/value (``put`` is None exactly for deletes) and
+    the *complete* clock: clock key order is irrelevant, but a missing key,
+    an extra key (even a zero component) or a different component value all
+    count as different content.
+    """
+
+    return (
+        a.key == b.key
+        and a.put == b.put
+        and a.clock == b.clock
+    )
+
+
 def _merge_events(
     replica_ids: list[str],
     current: list[Event],
@@ -564,10 +580,11 @@ def _merge_events(
 ) -> list[Event]:
     """Merge incoming events by (replica_id, seq) into the stored history.
 
-    Identical events (same identity and same full content) are ignored; the
-    same (replica_id, seq) with different content is a 409.  The merged list
-    is then checked against the original batch validation and the 120-event
-    cap (422).  Either the whole merge applies or nothing does.
+    Identical events (same identity and same full content, including the
+    complete clock) are ignored; the same (replica_id, seq) with different
+    content is a 409.  The merged list is then checked against the original
+    batch validation and the 120-event cap (422).  Either the whole merge
+    applies or nothing does.
     """
 
     stored = {(ev.replica_id, ev.seq): ev for ev in current}
@@ -576,9 +593,7 @@ def _merge_events(
     for i, ev in enumerate(incoming):
         prior = stored.get((ev.replica_id, ev.seq))
         if prior is not None:
-            if _canonical_wire(prior, replica_ids) != _canonical_wire(
-                ev, replica_ids
-            ):
+            if not _same_event_content(prior, ev):
                 raise ConflictStateError(
                     [
                         {
@@ -1140,7 +1155,9 @@ def read_history(history_id: str) -> dict:
 def merge_history_events(history_id: str, body: MergeEventsRequest) -> dict:
     """Merge offline events into a history and return the merged state.
 
-    Merge key is (replica_id, seq): identical events are ignored and the same
+    Merge key is (replica_id, seq): identical events (same key, op/value and
+    complete clock -- key order irrelevant, but missing/extra keys or
+    differing components count as different content) are ignored and the same
     identity with different content is 409.  The merged history must still
     satisfy the original validation and the 120-event limit, otherwise the
     whole merge is rejected with 422 and nothing is written.

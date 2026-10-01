@@ -514,9 +514,13 @@ SQLite 文件，路径由环境变量 `HISTORY_DB_PATH` 决定；`docker compose
 
 汇入规则：
 
-- 按 `(replica_id, seq)` 合并：同标识且内容完全相同的事件忽略（可重复发送）；
-  同标识但 `key`/操作/值/`clock` 任一不同，返回 **409**
-  （`event_content_mismatch`，错误中带汇入批次的 `event_index`）；
+- 按 `(replica_id, seq)` 合并：同标识且内容完全相同的事件忽略（可重复发送，
+  `clock` 键顺序不影响相等）；同标识但 `key`/操作/值不同，或 `clock` 的
+  键集合或任一分量不同——包括缺少分量、**多出分量（即使值为 0）**——
+  均属异内容，返回 **409**（`event_content_mismatch`，错误中带汇入批次的
+  `event_index`）；
+- 未重复的新事件仍按原规则校验：`clock` 必须恰好覆盖全部 `replica_ids`，
+  覆盖不合法返回 **422**（`clock_replica_coverage`），而不是 409；
 - 合并后的整份历史重新执行原校验（因果、连续性、clock 覆盖等），失败
   **422**；事件总数上限仍为 **120**（超出为 `batch_full`，422）；
 - 每次写入**全部生效或全部不生效**（单事务），失败时历史保持原样。
@@ -624,6 +628,45 @@ curl -sS -X POST \
 ```
 
 合并后违反因果/连续性等原校验，或超出 120 条上限时返回 **422**。
+
+判等逐字比较 `key`、操作/值与**完整 `clock`**：`clock` 键顺序任意都算相同，
+但缺少分量、多出分量（**即使多出的分量值为 0**）、分量值不同都算异内容，
+返回 **409** 且整批不写入（连同批内合法新事件也不写入）。下面重发 `r1/1`
+时多带了一个 `r3: 0` 分量，同批的 `r1/2` 虽是合法新事件也不会入库：
+
+```bash
+curl -sS -i -X POST \
+  http://localhost:8000/api/histories/f82cdf528c99461c9a6becef9edddd1f/events \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "events": [
+      {"replica_id": "r1", "seq": 1, "key": "name", "put": "alice",
+       "clock": {"r1": 1, "r2": 0, "r3": 0}},
+      {"replica_id": "r1", "seq": 2, "key": "other", "put": "x",
+       "clock": {"r1": 2, "r2": 1}}
+    ]
+  }'
+```
+
+返回 `409 Conflict`，`event_index` 指向汇入批次中的异内容事件（下标 0）：
+
+```json
+{
+  "detail": [
+    {
+      "code": "event_content_mismatch",
+      "message": "event with replica_id 'r1', seq 1 already exists in this history with different content; ...",
+      "event_index": 0
+    }
+  ]
+}
+```
+
+缺少某个 `clock` 键、或分量值不同（如把 `r2: 0` 写成 `r2: 1`）的重发同样
+返回该 409。反之，仅改变 `clock` 键的书写顺序（如
+`{"r2": 0, "r1": 1}`）的逐字重发仍被忽略；而对**未重复的新事件**，多带
+`r3` 分量属于 clock 覆盖不合法，照旧返回 **422**
+（`clock_replica_coverage`）。
 
 ### 13. 按 ID 提交冲突处理：核对当前 versions、接续序号
 

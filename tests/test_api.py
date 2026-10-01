@@ -1220,6 +1220,141 @@ def test_history_merge_same_identity_different_content_is_409_and_atomic():
     assert after["events"] == before["events"]
 
 
+def test_history_merge_resend_extra_zero_clock_component_is_409_and_atomic():
+    # The stored r1/1 clock covers exactly r1,r2; a resend carrying an extra
+    # (even zero) component is different content, not the same event.
+    hid = create_conflict_history()
+
+    before = hist_get(hid).json()
+    r = hist_merge(
+        hid,
+        [
+            ev("r1", 1, "name", put="alice", clock={"r1": 1, "r2": 0, "r3": 0}),
+            ev("r1", 2, "other", put="x", clock={"r1": 2, "r2": 1}),
+        ],
+    )
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    (err,) = detail
+    assert err["code"] == "event_content_mismatch"
+    assert err["event_index"] == 0
+
+    # The whole batch, including the valid new event, is rejected.
+    assert hist_get(hid).json()["events"] == before["events"]
+
+
+def test_history_merge_resend_missing_clock_component_is_409_not_500():
+    # A resend whose clock lacks a component used to raise KeyError (500)
+    # during comparison; it must be reported as different content.
+    hid = create_conflict_history()
+
+    before = hist_get(hid).json()
+    r = hist_merge(
+        hid,
+        [
+            ev("r1", 1, "name", put="alice", clock={"r1": 1}),
+            ev("r1", 2, "other", put="x", clock={"r1": 2, "r2": 1}),
+        ],
+    )
+    assert r.status_code == 409, r.text
+    (err,) = r.json()["detail"]
+    assert err["code"] == "event_content_mismatch"
+    assert err["event_index"] == 0
+    assert hist_get(hid).json()["events"] == before["events"]
+
+
+def test_history_merge_resend_differing_clock_value_is_409():
+    hid = create_conflict_history()
+
+    before = hist_get(hid).json()
+    r = hist_merge(
+        hid,
+        [ev("r1", 1, "name", put="alice", clock={"r1": 1, "r2": 1})],
+    )
+    assert r.status_code == 409, r.text
+    (err,) = r.json()["detail"]
+    assert err["code"] == "event_content_mismatch"
+    assert err["event_index"] == 0
+    assert hist_get(hid).json()["events"] == before["events"]
+
+
+def test_history_merge_exact_resend_with_reordered_clock_keys_is_ignored():
+    hid = create_conflict_history()
+
+    # Same full content, clock keys in a different order: identical resend.
+    r = hist_merge(
+        hid,
+        [
+            ev("r2", 1, "name", put="bob", clock={"r2": 1, "r1": 0}),
+            ev("r1", 2, "other", put="y", clock={"r2": 1, "r1": 2}),
+        ],
+    )
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert [(e["replica_id"], e["seq"]) for e in data["events"]] == [
+        ("r1", 1),
+        ("r1", 2),
+        ("r2", 1),
+    ]
+    # Canonical storage/response order is unchanged for the resent events.
+    assert data["events"][0]["clock"] == {"r1": 1, "r2": 0}
+    assert data["events"][2]["clock"] == {"r1": 0, "r2": 1}
+
+
+def test_history_merge_new_event_bad_clock_coverage_still_422():
+    # A non-duplicate new event with an extra component is structurally
+    # invalid; that stays a 422 rather than becoming a content conflict.
+    hid = create_conflict_history()
+
+    before = hist_get(hid).json()
+    r = hist_merge(
+        hid,
+        [ev("r1", 2, "other", put="x", clock={"r1": 2, "r2": 1, "r3": 0})],
+    )
+    assert_422(r, "clock_replica_coverage")
+    assert hist_get(hid).json()["events"] == before["events"]
+
+
+def test_history_merge_in_batch_duplicate_clock_mismatch_is_409():
+    # Two copies of the same identity inside the incoming batch with
+    # different clocks: 409 (content mismatch), atomic, nothing written.
+    hid = create_conflict_history()
+
+    before = hist_get(hid).json()
+    r = hist_merge(
+        hid,
+        [
+            ev("r1", 2, "k", put="a", clock={"r1": 2, "r2": 0}),
+            ev("r1", 2, "k", put="a", clock={"r1": 2, "r2": 1}),
+        ],
+    )
+    assert r.status_code == 409, r.text
+    (err,) = r.json()["detail"]
+    assert err["code"] == "event_content_mismatch"
+    assert err["event_index"] == 1
+    assert hist_get(hid).json()["events"] == before["events"]
+
+
+def test_history_merge_in_batch_exact_duplicate_with_extra_component_is_409():
+    # Neither copy is stored yet, but the second carries an extra component:
+    # still different content under the full-clock comparison.
+    hid = create_conflict_history()
+
+    before = hist_get(hid).json()
+    r = hist_merge(
+        hid,
+        [
+            ev("r1", 2, "k", put="a", clock={"r1": 2, "r2": 1}),
+            ev("r1", 2, "k", put="a", clock={"r1": 2, "r2": 1, "r3": 0}),
+        ],
+    )
+    assert r.status_code == 409, r.text
+    (err,) = r.json()["detail"]
+    assert err["code"] == "event_content_mismatch"
+    assert err["event_index"] == 1
+    assert hist_get(hid).json()["events"] == before["events"]
+
+
 def test_history_merge_failing_validation_is_422_and_atomic():
     # Valid seed on r1; incoming batch breaks contiguity on r2.
     r = hist_create(
