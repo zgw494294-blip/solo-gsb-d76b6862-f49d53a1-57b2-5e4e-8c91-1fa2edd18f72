@@ -1,0 +1,15 @@
+services:
+  api:
+    build: .
+    image: replica-reconciler:latest
+    container_name: replica-reconciler
+    environment:
+      HISTORY_DB_PATH: /data/history.db
+    volumes:
+      - history-data:/data
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+volumes:
+  history-data:
