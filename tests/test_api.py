@@ -1220,6 +1220,127 @@ def test_history_merge_same_identity_different_content_is_409_and_atomic():
     assert after["events"] == before["events"]
 
 
+def assert_merge_409(r, expected_index):
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    (err,) = detail
+    assert err["code"] == "event_content_mismatch"
+    assert err["event_index"] == expected_index
+    return err
+
+
+def test_history_merge_duplicate_extra_zero_clock_component_is_409_and_atomic():
+    # Regression: a resend must be compared on its FULL clock.  An extra
+    # component (even with value 0) is different content -> 409, and the
+    # legal new event travelling in the same batch must not be written.
+    hid = create_conflict_history()
+    before = hist_get(hid).json()
+
+    r = hist_merge(
+        hid,
+        [
+            ev("r1", 1, "name", put="alice", clock={"r1": 1, "r2": 0, "r3": 0}),
+            ev("r1", 2, "other", put="x", clock={"r1": 2, "r2": 1}),
+        ],
+    )
+    assert_merge_409(r, 0)
+    assert hist_get(hid).json()["events"] == before["events"]
+
+
+def test_history_merge_duplicate_missing_clock_component_is_409_not_500():
+    # Regression: a missing clock component must not raise KeyError while
+    # projecting the clock; it is simply different content -> 409.
+    hid = create_conflict_history()
+    before = hist_get(hid).json()
+
+    r = hist_merge(
+        hid,
+        [ev("r2", 1, "name", put="bob", clock={"r2": 1})],
+    )
+    assert_merge_409(r, 0)
+    assert hist_get(hid).json()["events"] == before["events"]
+
+
+def test_history_merge_duplicate_changed_clock_component_value_is_409():
+    hid = create_conflict_history()
+    before = hist_get(hid).json()
+
+    r = hist_merge(
+        hid,
+        [
+            # Same key/op/value as stored r2/1 but a different clock component.
+            ev("r2", 1, "name", put="bob", clock={"r1": 1, "r2": 1}),
+        ],
+    )
+    assert_merge_409(r, 0)
+    assert hist_get(hid).json()["events"] == before["events"]
+
+
+def test_history_merge_duplicate_clock_key_order_does_not_matter():
+    # Equal clocks serialized with the keys in a different order are still
+    # the same event -> ignored, nothing changes.
+    hid = create_conflict_history()
+    before = hist_get(hid).json()
+
+    r = hist_merge(
+        hid,
+        [
+            {
+                "replica_id": "r1",
+                "seq": 1,
+                "key": "name",
+                "put": "alice",
+                "clock": {"r2": 0, "r1": 1},
+            }
+        ],
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["events"] == before["events"]
+
+
+def test_history_merge_batch_internal_duplicate_extra_clock_component_is_409():
+    # The same full-content comparison applies to two copies of a brand-new
+    # (replica_id, seq) inside one batch: an extra clock component on the
+    # second copy is a content mismatch -> 409, nothing is written.
+    hid = hist_create(
+        ["r1", "r2"],
+        [ev("r1", 1, "k", put="a", clock={"r1": 1, "r2": 0})],
+    ).json()["id"]
+    before = hist_get(hid).json()
+
+    r = hist_merge(
+        hid,
+        [
+            ev("r2", 1, "k", put="b", clock={"r1": 1, "r2": 1}),
+            ev("r2", 1, "k", put="b", clock={"r1": 1, "r2": 1, "r3": 0}),
+        ],
+    )
+    assert_merge_409(r, 1)
+    assert hist_get(hid).json()["events"] == before["events"]
+
+
+def test_history_merge_new_event_illegal_clock_coverage_is_still_422():
+    # Coverage rules only apply to genuinely new events (the full history is
+    # re-validated): extra or missing clock components on a not-yet-stored
+    # identity stay 422, not 409, and nothing is written.
+    hid = create_conflict_history()
+    before = hist_get(hid).json()
+
+    r = hist_merge(
+        hid,
+        [ev("r1", 2, "k", put="x", clock={"r1": 2, "r2": 1, "r3": 0})],
+    )
+    assert_422(r, "clock_replica_coverage")
+    assert hist_get(hid).json()["events"] == before["events"]
+
+    r = hist_merge(
+        hid,
+        [ev("r1", 2, "k", put="x", clock={"r1": 2})],
+    )
+    assert_422(r, "clock_replica_coverage")
+    assert hist_get(hid).json()["events"] == before["events"]
+
+
 def test_history_merge_failing_validation_is_422_and_atomic():
     # Valid seed on r1; incoming batch breaks contiguity on r2.
     r = hist_create(

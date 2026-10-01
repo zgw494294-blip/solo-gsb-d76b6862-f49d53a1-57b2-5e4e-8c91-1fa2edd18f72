@@ -514,11 +514,14 @@ SQLite 文件，路径由环境变量 `HISTORY_DB_PATH` 决定；`docker compose
 
 汇入规则：
 
-- 按 `(replica_id, seq)` 合并：同标识且内容完全相同的事件忽略（可重复发送）；
-  同标识但 `key`/操作/值/`clock` 任一不同，返回 **409**
-  （`event_content_mismatch`，错误中带汇入批次的 `event_index`）；
+- 按 `(replica_id, seq)` 合并：同标识且内容完全相同的事件忽略（可重复发送，
+  `clock` 键的顺序不影响相等）；同标识但 `key`、操作、值或**完整 `clock`**
+  任一不同，返回 **409**（`event_content_mismatch`，错误中带汇入批次的
+  `event_index`）——`clock` 缺少分量、多出分量（即使多出的分量为 `0`）、或
+  任一分量值不同，都算异内容；
 - 合并后的整份历史重新执行原校验（因果、连续性、clock 覆盖等），失败
-  **422**；事件总数上限仍为 **120**（超出为 `batch_full`，422）；
+  **422**；因此**未重复的新事件**若 `clock` 覆盖不合法（缺/多分量等），
+  仍返回 **422** 而非 409；事件总数上限仍为 **120**（超出为 `batch_full`，422）；
 - 每次写入**全部生效或全部不生效**（单事务），失败时历史保持原样。
 
 冲突提交规则：
@@ -625,7 +628,64 @@ curl -sS -X POST \
 
 合并后违反因果/连续性等原校验，或超出 120 条上限时返回 **422**。
 
-### 13. 按 ID 提交冲突处理：核对当前 versions、接续序号
+### 13. 汇入重复事件：完整 clock 逐字相等才忽略，否则 409 且整批不写入
+
+判等比较的是事件的**完整内容**（`key`、操作、值与完整 `clock`）。先看一次
+完全相同的重发——仅 `clock` 键的书写顺序不同仍然相等，事件被忽略：
+
+```bash
+curl -sS -X POST \
+  http://localhost:8000/api/histories/f82cdf528c99461c9a6becef9edddd1f/events \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "events": [
+      {"replica_id": "r1", "seq": 1, "key": "name", "put": "alice",
+       "clock": {"r2": 0, "r1": 1}}
+    ]
+  }'
+```
+
+返回 200，历史事件数不变。但同一 `(replica_id, seq)` 的重发只要 `clock`
+多出一个分量——**即使多出的分量值为 `0`**——就算异内容。下例把异内容的
+`r1/1` 与一条同批合法新事件 `r1/2` 一起汇入：
+
+```bash
+curl -sS -i -X POST \
+  http://localhost:8000/api/histories/f82cdf528c99461c9a6becef9edddd1f/events \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "events": [
+      {"replica_id": "r1", "seq": 1, "key": "name", "put": "alice",
+       "clock": {"r1": 1, "r2": 0, "r3": 0}},
+      {"replica_id": "r1", "seq": 2, "key": "other", "put": "x",
+       "clock": {"r1": 2, "r2": 1}}
+    ]
+  }'
+```
+
+返回 `409 Conflict`，整批（包括同批合法的 `r1/2`）都不写入：
+
+```json
+{
+  "detail": [
+    {
+      "code": "event_content_mismatch",
+      "message": "event with replica_id 'r1', seq 1 already exists in this history with different content; stored {'replica_id': 'r1', 'seq': 1, 'key': 'name', 'put': 'alice', 'clock': {'r1': 1, 'r2': 0}}, incoming {'replica_id': 'r1', 'seq': 1, 'key': 'name', 'put': 'alice', 'clock': {'r1': 1, 'r2': 0, 'r3': 0}}",
+      "event_index": 0
+    }
+  ]
+}
+```
+
+同样地，重发事件的 `clock` **缺少**某个分量、或某个分量值与已存事件不同
+（例如已存为 `{"r1": 0, "r2": 1}`，重发为 `{"r1": 1, "r2": 1}`），也返回
+同样的 **409** 与 `event_index`，不会因缺键而报 500。
+
+注意：覆盖校验只针对**未重复的新事件**。若新身份的事件自身 `clock` 覆盖
+不合法（缺少或多出副本分量），仍由合并后的整批校验返回 **422**
+（`clock_replica_coverage`，带该事件的 `event_index`），而不是 409。
+
+### 14. 按 ID 提交冲突处理：核对当前 versions、接续序号
 
 请求体就是原冲突处理参数（与 `/api/resolve-conflict` 相比少了
 `replica_ids`、`events`）：
@@ -669,7 +729,7 @@ curl -sS -X POST \
 排序）。再用旧的 `versions` 提交会返回 **409**（`key_not_conflicted` 或
 `conflict_versions_mismatch`），不生成事件、不占用 `r2/2` 序号。
 
-### 14. 重启容器后历史仍在
+### 15. 重启容器后历史仍在
 
 数据在命名卷 `history-data` 中，重启/重建容器（不改卷）后按原 ID 仍可读取：
 

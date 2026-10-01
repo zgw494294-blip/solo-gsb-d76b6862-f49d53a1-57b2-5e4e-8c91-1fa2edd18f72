@@ -20,8 +20,10 @@ key's post-append verdict.
 The three endpoints above are stateless: request payloads are never persisted.
 A second family of endpoints (/api/histories) gives multiple callers one
 shared, persistent history created from a valid batch: callers then merge in
-more offline events by ID (identical events are ignored, same
-replica_id/seq with different content is 409) and commit conflict resolutions
+more offline events by ID (identical events -- full content including every
+clock component -- are ignored; same replica_id/seq with different key,
+operation, value or clock, including a missing or extra-zero clock
+component, is 409) and commit conflict resolutions
 by ID with only the original resolution parameters (key, writer, versions,
 op) -- the stored versions are re-checked at commit time and stale lists get
 409.  Histories live in a local SQLite database (HISTORY_DB_PATH, WAL) and
@@ -557,6 +559,24 @@ def _batch_full_error() -> BatchError:
     )
 
 
+def _same_event_content(a: Event, b: Event) -> bool:
+    """Whether two events sharing an identity carry identical content.
+
+    Compares the full wire content: key, operation kind, value and the
+    *complete* clock -- not just the components projected onto the history's
+    replica_ids.  Clock component order is irrelevant (dict equality), but a
+    missing component, an extra component (even when its value is 0), or any
+    differing component value makes the two events different content.
+    """
+
+    return (
+        a.key == b.key
+        and (a.put is None) == (b.put is None)
+        and a.put == b.put
+        and a.clock == b.clock
+    )
+
+
 def _merge_events(
     replica_ids: list[str],
     current: list[Event],
@@ -564,10 +584,13 @@ def _merge_events(
 ) -> list[Event]:
     """Merge incoming events by (replica_id, seq) into the stored history.
 
-    Identical events (same identity and same full content) are ignored; the
-    same (replica_id, seq) with different content is a 409.  The merged list
-    is then checked against the original batch validation and the 120-event
-    cap (422).  Either the whole merge applies or nothing does.
+    Identical events (same identity and same full content, including every
+    clock component) are ignored; the same (replica_id, seq) with different
+    key, operation, value or clock is a 409 -- an extra zero-valued clock
+    component or a missing component already count as different content.
+    The merged list is then checked against the original batch validation
+    (so a genuinely new event with illegal clock coverage still gets 422) and
+    the 120-event cap.  Either the whole merge applies or nothing does.
     """
 
     stored = {(ev.replica_id, ev.seq): ev for ev in current}
@@ -576,9 +599,7 @@ def _merge_events(
     for i, ev in enumerate(incoming):
         prior = stored.get((ev.replica_id, ev.seq))
         if prior is not None:
-            if _canonical_wire(prior, replica_ids) != _canonical_wire(
-                ev, replica_ids
-            ):
+            if not _same_event_content(prior, ev):
                 raise ConflictStateError(
                     [
                         {
